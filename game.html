@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AR Polygon Game - Hand Control</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Arial', sans-serif; }
+        
+        /* Video feeds (Hidden video element, visible canvas) */
+        .input_video { display: none; }
+        #webcam-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 1; /* Behind UI, but behind 3D? No, 3D is on top transparently */
+            transform: scaleX(-1); /* Mirror effect */
+        }
+
+        /* Three.js Canvas */
+        #three-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        /* UI Overlay */
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 10;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px 0;
+        }
+
+        h1 { color: #fff; text-shadow: 0 0 10px #000; font-size: 24px; margin: 0; background: rgba(0,0,0,0.5); padding: 10px 20px; border-radius: 20px; }
+        
+        #status-box {
+            background: rgba(0, 0, 0, 0.7);
+            color: #00ff00;
+            font-size: 40px;
+            padding: 20px 40px;
+            border-radius: 15px;
+            border: 2px solid #fff;
+            text-align: center;
+            margin-bottom: 50px;
+        }
+
+        .finger-count { color: #00ffff; font-size: 60px; display: block; }
+        .instruction { font-size: 18px; color: #ccc; display: block; margin-top: 5px; }
+
+        /* Progress Bar for Locking In */
+        #lock-bar-container {
+            width: 300px; height: 10px; background: #333; margin-top: 10px;
+            border-radius: 5px; overflow: hidden; display: none;
+        }
+        #lock-bar {
+            width: 0%; height: 100%; background: #00ff00;
+            transition: width 0.1s linear;
+        }
+
+    </style>
+</head>
+<body>
+
+    <video class="input_video"></video>
+    <canvas id="webcam-canvas"></canvas>
+    
+    <div id="ui-layer">
+        <h1>Shape Hunter: AR Edition</h1>
+        
+        <div id="status-box">
+            <span class="instruction">Show Fingers to Match Sides</span>
+            <span id="detected-count" class="finger-count">0</span>
+            <div id="lock-bar-container"><div id="lock-bar"></div></div>
+            <div id="message">Loading Camera...</div>
+        </div>
+    </div>
+
+    <script>
+        // ==========================================
+        // 1. THREE.JS SETUP (The Game Engine)
+        // ==========================================
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true }); // Alpha true = transparent background
+        
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.domElement.id = "three-canvas";
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const light = new THREE.DirectionalLight(0xffffff, 1);
+        light.position.set(0, 5, 10);
+        scene.add(light);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+        camera.position.z = 8;
+
+        // Game State
+        let currentMesh = null;
+        let currentWireframe = null;
+        let targetSides = 0;
+        let isTransitioning = false;
+
+        // Create Shape Function
+        function spawnShape(sides) {
+            if (currentMesh) scene.remove(currentMesh);
+            
+            // Generate Polygon
+            const geometry = new THREE.CircleGeometry(2.5, sides);
+            const material = new THREE.MeshStandardMaterial({ 
+                color: Math.random() * 0xffffff, 
+                roughness: 0.2, metalness: 0.6, 
+                side: THREE.DoubleSide 
+            });
+
+            currentMesh = new THREE.Mesh(geometry, material);
+            
+            // Wireframe
+            const edges = new THREE.EdgesGeometry(geometry);
+            currentWireframe = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 3 }));
+            
+            currentMesh.add(currentWireframe);
+            scene.add(currentMesh);
+            targetSides = sides;
+        }
+
+        function nextLevel() {
+            if (isTransitioning) return;
+            // Generate random sides between 3 (Triangle) and 10 (Decagon)
+            const sides = Math.floor(Math.random() * (8)) + 3; // 3 to 10
+            spawnShape(sides);
+            
+            document.getElementById('message').innerText = `Make a shape with ${sides} sides!`;
+            document.getElementById('message').style.color = "white";
+        }
+
+        // ==========================================
+        // 2. MEDIAPIPE HAND TRACKING (The Vision)
+        // ==========================================
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const canvasElement = document.getElementById('webcam-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const countDisplay = document.getElementById('detected-count');
+        const lockBar = document.getElementById('lock-bar');
+        const lockContainer = document.getElementById('lock-bar-container');
+
+        let lockTimer = 0;
+        const LOCK_THRESHOLD = 30; // Frames to hold pose (~1 second)
+
+        function onResults(results) {
+            // Draw Webcam Feed
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+            
+            let totalFingers = 0;
+
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    // Draw Skeleton
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                    drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1});
+
+                    // Count Fingers
+                    totalFingers += countFingersOnHand(landmarks);
+                }
+            }
+            canvasCtx.restore();
+
+            // --- GAME LOGIC INTEGRATION ---
+            updateGameLogic(totalFingers);
+        }
+
+        // --- Finger Counting Logic ---
+        function countFingersOnHand(lm) {
+            let count = 0;
+            // Thumb: Compare x position of tip vs knuckle (IP)
+            // Note: This logic assumes palm facing camera. 
+            // Better heuristic: Distance from wrist or relative X depending on hand side. 
+            // Simple check: Tip Y < Knuckle Y doesn't work for thumb.
+            // Using simplified vector logic for thumb is complex, skipping strict thumb check for simplicity often works better in simple games, 
+            // BUT let's try a distance check: If Tip is far from base? 
+            // Let's use standard "Tip is higher than PIP" for 4 fingers.
+            
+            // Index (8 vs 6), Middle (12 vs 10), Ring (16 vs 14), Pinky (20 vs 18)
+            // Note: Y coordinates go DOWN in canvas. Lower value = Higher on screen.
+            if (lm[8].y < lm[6].y) count++; 
+            if (lm[12].y < lm[10].y) count++;
+            if (lm[16].y < lm[14].y) count++;
+            if (lm[20].y < lm[18].y) count++;
+
+            // Thumb (4 vs 3). Direction depends on Left vs Right hand. 
+            // Simple hack: Is tip further from pinky base (17) than the thumb knuckle (2)?
+            // Or just check if thumb tip x is "outside". 
+            // Simplest for general use: Check distance between Tip(4) and PinkyFinger(17). 
+            // If extended, distance is large.
+            const thumbDist = Math.hypot(lm[4].x - lm[17].x, lm[4].y - lm[17].y);
+            // This threshold requires tuning. Let's assume > 0.2 is open.
+            // Actually, comparing Tip X to MCP X is standard.
+            // Let's just assume if it's "far enough" from the index finger base.
+            if (Math.hypot(lm[4].x - lm[2].x, lm[4].y - lm[2].y) > 0.05) count++;
+
+            return count;
+        }
+
+        function updateGameLogic(fingerCount) {
+            countDisplay.innerText = fingerCount;
+
+            if (isTransitioning) return;
+
+            if (fingerCount === targetSides) {
+                // User is holding correct number!
+                lockContainer.style.display = 'block';
+                lockTimer++;
+                
+                let percent = (lockTimer / LOCK_THRESHOLD) * 100;
+                lockBar.style.width = percent + "%";
+
+                if (lockTimer >= LOCK_THRESHOLD) {
+                    // SUCCESS!
+                    triggerSuccess();
+                }
+            } else {
+                // User moved or is wrong
+                lockTimer = 0;
+                lockBar.style.width = "0%";
+                lockContainer.style.display = 'none';
+            }
+        }
+
+        function triggerSuccess() {
+            isTransitioning = true;
+            const msg = document.getElementById('message');
+            msg.innerText = "CORRECT!";
+            msg.style.color = "#00ff00";
+            
+            // Animation
+            let spinSpeed = 0.5;
+            
+            // Temp animation loop override
+            const successAnim = setInterval(() => {
+                if(currentMesh) {
+                    currentMesh.rotation.y += spinSpeed;
+                    currentMesh.scale.x += 0.01;
+                    currentMesh.scale.y += 0.01;
+                }
+            }, 16);
+
+            setTimeout(() => {
+                clearInterval(successAnim);
+                isTransitioning = false;
+                nextLevel();
+            }, 2000);
+        }
+
+        // --- MediaPipe Initialization ---
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.5
+        });
+        hands.onResults(onResults);
+
+        const cameraFeed = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        cameraFeed.start();
+
+        // ==========================================
+        // 3. ANIMATION LOOP
+        // ==========================================
+        function animate() {
+            requestAnimationFrame(animate);
+            if (currentMesh && !isTransitioning) {
+                currentMesh.rotation.x += 0.005;
+                currentMesh.rotation.y += 0.01;
+            }
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start Game
+        nextLevel();
+        animate();
+
+    </script>
+</body>
+</html>
